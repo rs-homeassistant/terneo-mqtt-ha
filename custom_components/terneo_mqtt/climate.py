@@ -1,5 +1,4 @@
-"""Terneo MQTT Climate Platform."""
-import json
+"""Terneo MQTT Climate Platform for Home Assistant."""
 import logging
 import voluptuous as vol
 
@@ -19,48 +18,32 @@ import homeassistant.helpers.config_validation as cv
 
 _LOGGER = logging.getLogger(__name__)
 
-CONF_SERIAL = "serial"
+CONF_DEVICE_ID = "device_id"
 
 PLATFORM_SCHEMA = cv.PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_SERIAL): cv.string,
+        vol.Required(CONF_DEVICE_ID): cv.string,
         vol.Optional(CONF_NAME): cv.string,
     }
 )
 
-OFFSET = 160.0
-DIVIDER = 10.0
-
-
-def terneo_to_temp(raw_val) -> float:
-    """Convert raw Terneo value to Celsius."""
-    try:
-        return (float(raw_val) - OFFSET) / DIVIDER
-    except (ValueError, TypeError):
-        return None
-
-
-def temp_to_terneo(celsius: float) -> str:
-    """Convert Celsius to raw Terneo integer string."""
-    return str(int(round((celsius * DIVIDER) + OFFSET)))
-
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
     """Set up Terneo thermostat via MQTT."""
-    serial = config[CONF_SERIAL]
-    name = config.get(CONF_NAME, f"Terneo {serial[-6:]}")
+    device_id = config[CONF_DEVICE_ID]
+    name = config.get(CONF_NAME, f"Terneo {device_id}")
 
-    async_add_entities([TerneoMqttClimate(hass, name, serial)])
+    async_add_entities([TerneoMqttClimate(hass, name, device_id)])
 
 
 class TerneoMqttClimate(ClimateEntity):
-    """Representation of Terneo thermostat over MQTT."""
+    """Representation of Terneo thermostat over native MQTT topics."""
 
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_precision = PRECISION_TENTHS
     _attr_min_temp = 5.0
     _attr_max_temp = 45.0
-    _attr_target_temperature_step = 1.0
+    _attr_target_temperature_step = 0.5
     _attr_hvac_modes = [HVACMode.HEAT, HVACMode.OFF]
     _attr_supported_features = (
         ClimateEntityFeature.TARGET_TEMPERATURE
@@ -68,17 +51,22 @@ class TerneoMqttClimate(ClimateEntity):
         | ClimateEntityFeature.TURN_ON
     )
 
-    def __init__(self, hass, name: str, serial: str):
+    def __init__(self, hass, name: str, device_id: str):
         """Initialize entity."""
         self.hass = hass
         self._attr_name = name
-        self._serial = serial
-        self._attr_unique_id = f"terneo_mqtt_{serial}"
-        
-        # Топіки протоколу Terneo MQTT
-        self._topic_tele = f"terneo/{serial}/tele"
-        self._topic_cmd = f"terneo/{serial}/cmd"
-        
+        self._device_id = device_id
+        self._attr_unique_id = f"terneo_mqtt_{device_id.replace(' ', '_').lower()}"
+
+        # Топіки згідно з реальними даними пристрою
+        self._base_topic = f"house/{device_id}"
+        self._topic_floor_temp = f"{self._base_topic}/get/floorTemp"
+        self._topic_set_temp = f"{self._base_topic}/get/setTemp"
+        self._topic_power_off = f"{self._base_topic}/get/powerOff"
+
+        self._topic_send_temp = f"{self._base_topic}/set/setTemp"
+        self._topic_send_power = f"{self._base_topic}/set/powerOff"
+
         self._attr_current_temperature = None
         self._attr_target_temperature = None
         self._attr_hvac_mode = HVACMode.HEAT
@@ -86,41 +74,51 @@ class TerneoMqttClimate(ClimateEntity):
         self._attr_available = False
 
     async def async_added_to_hass(self):
-        """Subscribe to MQTT telemetry."""
-        await mqtt.async_subscribe(
-            self.hass, self._topic_tele, self._message_received, 0
-        )
-        # Запит телеметрії при старті
-        await mqtt.async_publish(self.hass, self._topic_cmd, json.dumps({"cmd": 4}))
+        """Subscribe to MQTT topics."""
+        async def floor_temp_received(msg):
+            try:
+                self._attr_current_temperature = float(msg.payload)
+                self._attr_available = True
+                self._update_action()
+                self.async_write_ha_state()
+            except ValueError:
+                pass
 
-    def _message_received(self, msg):
-        """Handle incoming telemetry message."""
-        try:
-            payload = json.loads(msg.payload)
-            self._attr_available = True
+        async def set_temp_received(msg):
+            try:
+                self._attr_target_temperature = float(msg.payload)
+                self._attr_available = True
+                self._update_action()
+                self.async_write_ha_state()
+            except ValueError:
+                pass
 
-            # t.1 = поточна температура датчика
-            if "t.1" in payload:
-                self._current_temp_raw = payload["t.1"]
-                self._attr_current_temperature = terneo_to_temp(self._current_temp_raw)
-
-            # t.5 = цільова температура
-            if "t.5" in payload:
-                self._attr_target_temperature = terneo_to_temp(payload["t.5"])
-
-            # f.0 = статус реле нагріву (0 - idle, 1 - heating)
-            if "f.0" in payload:
-                is_heating = str(payload["f.0"]) == "1"
-                self._attr_hvac_action = HVACAction.HEATING if is_heating else HVACAction.IDLE
-
-            # m.5 = стан живлення пристрою (0 - ON, 1 - OFF)
-            if "m.5" in payload:
-                is_off = str(payload["m.5"]) == "1"
+        async def power_off_received(msg):
+            try:
+                is_off = str(msg.payload).strip() == "1"
                 self._attr_hvac_mode = HVACMode.OFF if is_off else HVACMode.HEAT
+                self._attr_available = True
+                self._update_action()
+                self.async_write_ha_state()
+            except ValueError:
+                pass
 
-            self.async_write_ha_state()
-        except Exception as err:
-            _LOGGER.error("Failed to parse Terneo MQTT message: %s", err)
+        await mqtt.async_subscribe(self.hass, self._topic_floor_temp, floor_temp_received, 0)
+        await mqtt.async_subscribe(self.hass, self._topic_set_temp, set_temp_received, 0)
+        await mqtt.async_subscribe(self.hass, self._topic_power_off, power_off_received, 0)
+
+    def _update_action(self):
+        """Determine heating or idle state."""
+        if self._attr_hvac_mode == HVACMode.OFF:
+            self._attr_hvac_action = HVACAction.OFF
+        elif (
+            self._attr_current_temperature is not None
+            and self._attr_target_temperature is not None
+        ):
+            if self._attr_current_temperature < self._attr_target_temperature:
+                self._attr_hvac_action = HVACAction.HEATING
+            else:
+                self._attr_hvac_action = HVACAction.IDLE
 
     async def async_set_temperature(self, **kwargs):
         """Set new target temperature."""
@@ -128,20 +126,20 @@ class TerneoMqttClimate(ClimateEntity):
         if target_temp is None:
             return
 
-        raw_val = temp_to_terneo(target_temp)
-        payload = {"cmd": 1, "t.5": raw_val}
-
-        await mqtt.async_publish(self.hass, self._topic_cmd, json.dumps(payload))
+        # Відправка температури напряму в градусах (наприклад, 23.5)
+        await mqtt.async_publish(self.hass, self._topic_send_temp, f"{target_temp:.1f}")
         self._attr_target_temperature = target_temp
+        self._update_action()
         self.async_write_ha_state()
 
     async def async_set_hvac_mode(self, hvac_mode):
-        """Enable or disable thermostat."""
+        """Set HVAC mode (turn on/off)."""
         if hvac_mode == HVACMode.OFF:
-            payload = {"cmd": 1, "m.5": "1"}
+            await mqtt.async_publish(self.hass, self._topic_send_power, "1")
+            self._attr_hvac_mode = HVACMode.OFF
         else:
-            payload = {"cmd": 1, "m.5": "0"}
+            await mqtt.async_publish(self.hass, self._topic_send_power, "0")
+            self._attr_hvac_mode = HVACMode.HEAT
 
-        await mqtt.async_publish(self.hass, self._topic_cmd, json.dumps(payload))
-        self._attr_hvac_mode = hvac_mode
+        self._update_action()
         self.async_write_ha_state()
