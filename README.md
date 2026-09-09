@@ -1,0 +1,1 @@
+# terneo-mqtt-ha
