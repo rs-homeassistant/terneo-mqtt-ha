@@ -71,17 +71,17 @@ class TerneoMqttClimate(ClimateEntity):
         self._attr_target_temperature = None
         self._attr_hvac_mode = HVACMode.HEAT
         self._attr_hvac_action = HVACAction.IDLE
-        self._attr_available = False
+        self._attr_available = True
 
     async def async_added_to_hass(self):
-        """Subscribe to MQTT topics."""
+        """Subscribe to MQTT topics and request initial state."""
         async def floor_temp_received(msg):
             try:
                 self._attr_current_temperature = float(msg.payload)
                 self._attr_available = True
                 self._update_action()
                 self.async_write_ha_state()
-            except ValueError:
+            except (ValueError, TypeError):
                 pass
 
         async def set_temp_received(msg):
@@ -90,7 +90,7 @@ class TerneoMqttClimate(ClimateEntity):
                 self._attr_available = True
                 self._update_action()
                 self.async_write_ha_state()
-            except ValueError:
+            except (ValueError, TypeError):
                 pass
 
         async def power_off_received(msg):
@@ -100,12 +100,15 @@ class TerneoMqttClimate(ClimateEntity):
                 self._attr_available = True
                 self._update_action()
                 self.async_write_ha_state()
-            except ValueError:
+            except (ValueError, TypeError):
                 pass
 
         await mqtt.async_subscribe(self.hass, self._topic_floor_temp, floor_temp_received, 0)
         await mqtt.async_subscribe(self.hass, self._topic_set_temp, set_temp_received, 0)
         await mqtt.async_subscribe(self.hass, self._topic_power_off, power_off_received, 0)
+
+        # Надсилаємо запит поточних значень при запуску
+        await mqtt.async_publish(self.hass, f"{self._base_topic}/set/getTemp", "")
 
     def _update_action(self):
         """Determine heating or idle state."""
@@ -126,7 +129,7 @@ class TerneoMqttClimate(ClimateEntity):
         if target_temp is None:
             return
 
-        # Відправка температури напряму в градусах (наприклад, 23.5)
+        # Відправка температури в градусах (наприклад, 23.5)
         await mqtt.async_publish(self.hass, self._topic_send_temp, f"{target_temp:.1f}")
         self._attr_target_temperature = target_temp
         self._update_action()
