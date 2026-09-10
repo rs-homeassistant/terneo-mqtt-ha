@@ -44,7 +44,8 @@ class TerneoMqttClimate(ClimateEntity):
     _attr_min_temp = 5.0
     _attr_max_temp = 45.0
     _attr_target_temperature_step = 0.5
-    _attr_hvac_modes = [HVACMode.HEAT, HVACMode.OFF]
+    # Додано режим AUTO для розкладу
+    _attr_hvac_modes = [HVACMode.HEAT, HVACMode.AUTO, HVACMode.OFF]
     _attr_supported_features = (
         ClimateEntityFeature.TARGET_TEMPERATURE
         | ClimateEntityFeature.TURN_OFF
@@ -58,27 +59,30 @@ class TerneoMqttClimate(ClimateEntity):
         self._device_id = device_id
         self._attr_unique_id = f"terneo_mqtt_{device_id.replace(' ', '_').lower()}"
 
-        # Топіки згідно з реальними даними пристрою
+        # Топіки
         self._base_topic = f"house/{device_id}"
         self._topic_floor_temp = f"{self._base_topic}/get/floorTemp"
         self._topic_set_temp = f"{self._base_topic}/get/setTemp"
         self._topic_power_off = f"{self._base_topic}/get/powerOff"
+        self._topic_mode = f"{self._base_topic}/get/mode"
 
         self._topic_send_temp = f"{self._base_topic}/set/setTemp"
         self._topic_send_power = f"{self._base_topic}/set/powerOff"
+        self._topic_send_mode = f"{self._base_topic}/set/mode"
 
         self._attr_current_temperature = None
         self._attr_target_temperature = None
         self._attr_hvac_mode = HVACMode.HEAT
         self._attr_hvac_action = HVACAction.IDLE
         self._attr_available = True
+        self._is_power_off = False
+        self._terneo_mode = 0
 
     async def async_added_to_hass(self):
         """Subscribe to MQTT topics and request initial state."""
         async def floor_temp_received(msg):
             try:
                 self._attr_current_temperature = float(msg.payload)
-                self._attr_available = True
                 self._update_action()
                 self.async_write_ha_state()
             except (ValueError, TypeError):
@@ -87,7 +91,6 @@ class TerneoMqttClimate(ClimateEntity):
         async def set_temp_received(msg):
             try:
                 self._attr_target_temperature = float(msg.payload)
-                self._attr_available = True
                 self._update_action()
                 self.async_write_ha_state()
             except (ValueError, TypeError):
@@ -95,9 +98,17 @@ class TerneoMqttClimate(ClimateEntity):
 
         async def power_off_received(msg):
             try:
-                is_off = str(msg.payload).strip() == "1"
-                self._attr_hvac_mode = HVACMode.OFF if is_off else HVACMode.HEAT
-                self._attr_available = True
+                self._is_power_off = str(msg.payload).strip() == "1"
+                self._update_hvac_mode()
+                self._update_action()
+                self.async_write_ha_state()
+            except (ValueError, TypeError):
+                pass
+
+        async def mode_received(msg):
+            try:
+                self._terneo_mode = int(msg.payload)
+                self._update_hvac_mode()
                 self._update_action()
                 self.async_write_ha_state()
             except (ValueError, TypeError):
@@ -106,9 +117,19 @@ class TerneoMqttClimate(ClimateEntity):
         await mqtt.async_subscribe(self.hass, self._topic_floor_temp, floor_temp_received, 0)
         await mqtt.async_subscribe(self.hass, self._topic_set_temp, set_temp_received, 0)
         await mqtt.async_subscribe(self.hass, self._topic_power_off, power_off_received, 0)
+        await mqtt.async_subscribe(self.hass, self._topic_mode, mode_received, 0)
 
-        # Надсилаємо запит поточних значень при запуску
+        # Опитування поточного стану
         await mqtt.async_publish(self.hass, f"{self._base_topic}/set/getTemp", "")
+
+    def _update_hvac_mode(self):
+        """Map Terneo internal state to HA HVACMode."""
+        if self._is_power_off:
+            self._attr_hvac_mode = HVACMode.OFF
+        elif self._terneo_mode == 2:
+            self._attr_hvac_mode = HVACMode.AUTO
+        else:
+            self._attr_hvac_mode = HVACMode.HEAT
 
     def _update_action(self):
         """Determine heating or idle state."""
@@ -129,20 +150,31 @@ class TerneoMqttClimate(ClimateEntity):
         if target_temp is None:
             return
 
-        # Відправка температури в градусах (наприклад, 23.5)
         await mqtt.async_publish(self.hass, self._topic_send_temp, f"{target_temp:.1f}")
         self._attr_target_temperature = target_temp
         self._update_action()
         self.async_write_ha_state()
 
     async def async_set_hvac_mode(self, hvac_mode):
-        """Set HVAC mode (turn on/off)."""
+        """Set HVAC mode."""
         if hvac_mode == HVACMode.OFF:
             await mqtt.async_publish(self.hass, self._topic_send_power, "1")
-            self._attr_hvac_mode = HVACMode.OFF
-        else:
-            await mqtt.async_publish(self.hass, self._topic_send_power, "0")
-            self._attr_hvac_mode = HVACMode.HEAT
+            self._is_power_off = True
+        elif hvac_mode == HVACMode.AUTO:
+            # Увімкнути живлення (якщо було вимкнено) і виставити режим розкладу 2
+            if self._is_power_off:
+                await mqtt.async_publish(self.hass, self._topic_send_power, "0")
+                self._is_power_off = False
+            await mqtt.async_publish(self.hass, self._topic_send_mode, "2")
+            self._terneo_mode = 2
+        elif hvac_mode == HVACMode.HEAT:
+            # Увімкнути живлення і виставити ручний режим 1
+            if self._is_power_off:
+                await mqtt.async_publish(self.hass, self._topic_send_power, "0")
+                self._is_power_off = False
+            await mqtt.async_publish(self.hass, self._topic_send_mode, "1")
+            self._terneo_mode = 1
 
+        self._update_hvac_mode()
         self._update_action()
         self.async_write_ha_state()
